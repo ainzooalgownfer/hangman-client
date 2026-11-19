@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import re
 import socket
 import ssl
@@ -115,6 +116,7 @@ class Game:
         self.sid = None
         self.token = None
         self.next_id = 1
+        self.max_attempts = 6  # lu au NEW_GAME : le serveur peut être réglé autrement
 
     # --- sauvegarde locale de la session ---
     def save(self):
@@ -123,6 +125,7 @@ class Game:
             "session_id": self.sid,
             "resume_token": self.token,
             "next_id": self.next_id,
+            "max_attempts": self.max_attempts,
         }))
 
     def load(self):
@@ -130,6 +133,7 @@ class Game:
             data = json.loads(self.file.read_text())
             self.sid, self.token = data["session_id"], data["resume_token"]
             self.next_id = int(data.get("next_id", 1))
+            self.max_attempts = int(data.get("max_attempts", 6))
             return True
         except (OSError, ValueError, KeyError):
             return False
@@ -194,13 +198,18 @@ class Game:
                     if self.attach() is not None:
                         self.log("[i] Reconnecté, session reprise.")
                 self.conn.send(self.signed(msg))
-                return self.conn.receive()
+                resp = self.conn.receive()
+                if resp.get("code") == "TIMEOUT":
+                    # Le serveur a fermé la connexion pour inactivité AVANT notre requête :
+                    # ce n'est pas sa réponse. On se reconnecte et on renvoie la même requête.
+                    raise ConnectionResetError("fermée par le serveur après inactivité")
+                return resp
             except OSError as e:  # coupure, timeout, serveur injoignable...
                 self.drop()
                 if isinstance(e, ssl.SSLError) and not isinstance(e, (ssl.SSLEOFError, ssl.SSLZeroReturnError)):
                     # Certificat refusé ou protocole incompatible : réessayer ne changera rien
                     raise ConnectionError(f"erreur TLS : {e.reason or e}. Vérifie le certificat "
-                                          "et que le serveur est lancé avec --tls") from e
+                                          "et que le serveur a TLS activé (tls_cert dans sa config)") from e
                 attempt += 1
                 if attempt > RECONNECT_TRIES:
                     raise ConnectionError(f"serveur injoignable ({e})")
@@ -211,6 +220,7 @@ class Game:
         resp = self.request({"action": "NEW_GAME", "player": self.player})
         if resp.get("type") == "STATE":
             self.sid, self.token = resp["session_id"], resp.get("resume_token")
+            self.max_attempts = resp["attempts_left"]
             self.save()
         return resp
 
@@ -232,10 +242,16 @@ class Game:
         return self.request(msg, rid=rid)
 
 
-def show(state):
-    erreurs = 6 - state["attempts_left"]
+def stage(errors, max_attempts):
+    """Étape du dessin (0 à 6) : le dessin a 6 étapes, quel que soit le nombre d'essais."""
+    if max_attempts <= 0:
+        return 0
+    return max(0, min(6, math.ceil(errors * 6 / max_attempts)))
+
+
+def show(state, max_attempts=6):
     print()
-    print(PENDU[max(0, min(erreurs, 6))])
+    print(PENDU[stage(max_attempts - state["attempts_left"], max_attempts)])
     print(f"\nMot : {state['masked_word']}")
     print(f"Lettres tentées : {', '.join(state['tried_letters']) or '-'}")
     print(f"Essais restants : {state['attempts_left']}")
@@ -295,7 +311,7 @@ def main():
             print(f"[i] Connexion chiffrée ({game.tls_version}), certificat du serveur vérifié.")
         elif not tls:
             print("[i] Connexion en clair (lance avec --tls pour la chiffrer).")
-        show(state)
+        show(state, game.max_attempts)
         while state["status"] == "IN_PROGRESS":
             cmd = input("\nLettre (ou quit) : ").strip()
             if cmd.lower() == "quit":
@@ -316,7 +332,7 @@ def main():
                 print_error(resp)
                 continue
             state = resp
-            show(state)
+            show(state, game.max_attempts)
 
         if state["status"] == "LOST" and state.get("secret_word"):
             print(f"Le mot était : {state['secret_word']}")

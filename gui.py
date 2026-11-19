@@ -18,8 +18,9 @@ except ImportError:
     sys.exit(1)
 
 import ssl
+import unicodedata
 
-from client import DEFAULT_CA, Game, SessionLost, make_tls_context
+from client import DEFAULT_CA, Game, SessionLost, make_tls_context, stage
 
 # --- thème ---
 BG, PANEL = "#14161f", "#1d2030"
@@ -29,6 +30,11 @@ GOOD, BAD, WARN = "#3fbf7f", "#e5535b", "#e8a33d"
 KEY, KEY_HOVER = "#2a2e42", "#3a3f5a"
 SANS, MONO = "Helvetica Neue", "Menlo"
 KEYBOARD = ("AZERTYUIOP", "QSDFGHJKLM", "WXCVBN")
+
+
+def base_letter(ch):
+    """É -> E, Ç -> C : le serveur range les lettres tentées sans accent."""
+    return unicodedata.normalize("NFD", ch)[0].upper()
 
 
 class App:
@@ -162,7 +168,7 @@ class App:
                 tls = make_tls_context(DEFAULT_CA)
             except (OSError, ssl.SSLError):
                 self.set_status("Certificat server.crt introuvable dans le dossier du client "
-                                "(lance sh gen_cert.sh).", BAD)
+                                "(lance ./play.sh certs depuis Hangman-app, ou sh gen_cert.sh).", BAD)
                 return
 
         self.game = Game(host, port, name, log=self.log, tls=tls)
@@ -260,12 +266,12 @@ class App:
     def render(self, extra=None):
         s = self.state
         over = s["status"] != "IN_PROGRESS"
-        left = s["attempts_left"]
+        left, total = s["attempts_left"], self.game.max_attempts
         self.l_word.config(text=s["masked_word"])
-        self.l_lives.config(text="♥" * left + "♡" * (6 - left))
-        self.draw_hangman(6 - left)
+        self.l_lives.config(text="♥" * left + "♡" * max(0, total - left))
+        self.draw_hangman(stage(total - left, total))
 
-        revealed = set(s["masked_word"].split())
+        revealed = {base_letter(c) for c in s["masked_word"].split()}
         tried = set(s["tried_letters"])
         for ch, k in self.keys.items():
             if ch in tried:
