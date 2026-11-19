@@ -2,3 +2,4 @@ server.key
 sessions/
 __pycache__/
 .DS_Store
+server.crt
