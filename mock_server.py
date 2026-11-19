@@ -7,11 +7,17 @@ Lancement : python3 mock_server.py [--port 5050] [--ttl 300] [--tls]
 Étape 2 (reprise de session) :
 - une session est rattachée à UNE connexion (NEW_GAME ou RESUME) ;
 - à la déconnexion, elle est détachée et reste valable --ttl secondes ;
-- RESUME exige le resume_token secret reçu au NEW_GAME (sinon PLAYER_NOT_ALLOWED) ;
+- LETTER, QUIT et RESUME doivent être signés (champ "sig") : HMAC-SHA256 de
+  "session_id|request_id|action|letter" avec le resume_token reçu au NEW_GAME
+  (sinon PLAYER_NOT_ALLOWED) ;
+- RESUME doit avoir un request_id plus grand que tous ceux déjà vus, pour
+  qu'un RESUME intercepté ne puisse pas être renvoyé ;
 - une requête dont le request_id a déjà été traité n'est pas rejouée :
   le serveur renvoie la réponse déjà calculée (cas de la réponse perdue).
 """
 import argparse
+import hashlib
+import hmac
 import itertools
 import json
 import random
@@ -66,12 +72,20 @@ def new_game(req, rid, cid):
         "owner": cid,          # connexion à laquelle la session est rattachée
         "last_seen": time.time(),
         "done": {},            # request_id -> réponse déjà envoyée
+        "max_id": 0,           # plus grand request_id vu
     }
     with lock:
         sessions[s["id"]] = s
     r = state(s, "Partie lancée !", rid)
     r["resume_token"] = s["token"]
     return r
+
+
+def valid_sig(s, req):
+    """Recalcule la signature avec le jeton de la session et la compare à "sig"."""
+    text = f"{req.get('session_id')}|{req.get('request_id') or 0}|{req.get('action')}|{req.get('letter', '')}"
+    expected = hmac.new(s["token"].encode(), text.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, str(req.get("sig", "")))
 
 
 def play(s, action, req, rid):
@@ -124,9 +138,13 @@ def handle(req, cid):
             return error("UNKNOWN_SESSION", "Session inexistante ou expirée.", rid)
         s["last_seen"] = time.time()
 
+        if not valid_sig(s, req):
+            return error("PLAYER_NOT_ALLOWED", "Signature invalide.", rid)
+
         if action == "RESUME":
-            if not secrets.compare_digest(str(req.get("resume_token", "")), s["token"]):
-                return error("PLAYER_NOT_ALLOWED", "Jeton de reprise invalide : cette session ne t'appartient pas.", rid)
+            if (rid or 0) <= s["max_id"]:
+                return error("PLAYER_NOT_ALLOWED", "Requête de reprise déjà utilisée.", rid)
+            s["max_id"] = rid
             s["owner"] = cid  # la session passe sur la nouvelle connexion
             return state(s, "Partie reprise.", rid)
 
@@ -140,6 +158,7 @@ def handle(req, cid):
         resp = play(s, action, req, rid)
         if rid is not None:
             s["done"][rid] = resp
+            s["max_id"] = max(s["max_id"], rid)
         return resp
 
 

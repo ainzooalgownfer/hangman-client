@@ -12,8 +12,14 @@ En jeu : tape une lettre, ou
 
 La session (session_id, resume_token, compteur de requêtes) est sauvegardée dans
 sessions/<pseudo>.json : relance le client avec le même pseudo pour reprendre.
+
+Signature : le resume_token n'est reçu qu'une fois (NEW_GAME) et n'est jamais renvoyé.
+LETTER, QUIT et RESUME portent un champ "sig" = HMAC-SHA256(clé = resume_token,
+message = "session_id|request_id|action|letter"), que le serveur recalcule.
 """
 import argparse
+import hashlib
+import hmac
 import json
 import re
 import socket
@@ -32,6 +38,12 @@ def make_tls_context(cafile=DEFAULT_CA):
     ctx = ssl.create_default_context(cafile=str(cafile))
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     return ctx
+
+def sign(token, msg):
+    """Signature d'une requête, avec le resume_token comme clé (même calcul que le serveur)."""
+    text = f"{msg['session_id']}|{msg['request_id']}|{msg['action']}|{msg.get('letter', '')}"
+    return hmac.new(token.encode(), text.encode("utf-8"), hashlib.sha256).hexdigest()
+
 
 PENDU = [
     "\n\n\n\n\n=========",
@@ -134,6 +146,12 @@ class Game:
             self.save()  # le compteur survit à un redémarrage du client
         return rid
 
+    def signed(self, msg):
+        """Ajoute la signature, sauf pour NEW_GAME (pas encore de jeton)."""
+        if msg["action"] == "NEW_GAME" or not self.token:
+            return msg
+        return dict(msg, sig=sign(self.token, msg))
+
     def drop(self):
         if self.conn:
             self.conn.close()
@@ -153,8 +171,9 @@ class Game:
         self.conn = Connection(self.host, self.port, self.tls)
         if not self.sid:
             return None
-        self.conn.send({"action": "RESUME", "request_id": self.new_id(),
-                        "session_id": self.sid, "resume_token": self.token})
+        # Le jeton ne voyage pas : seule la signature prouve qu'on le possède.
+        self.conn.send(self.signed({"action": "RESUME", "request_id": self.new_id(),
+                                    "session_id": self.sid}))
         resp = self.conn.receive()
         if resp.get("type") == "ERROR":
             raise SessionLost(resp)
@@ -174,7 +193,7 @@ class Game:
                 if self.conn is None:
                     if self.attach() is not None:
                         self.log("[i] Reconnecté, session reprise.")
-                self.conn.send(msg)
+                self.conn.send(self.signed(msg))
                 return self.conn.receive()
             except OSError as e:  # coupure, timeout, serveur injoignable...
                 self.drop()
@@ -206,7 +225,7 @@ class Game:
         rid = self.new_id()
         if self.conn is None:
             self.attach()
-        self.conn.send(dict(msg, request_id=rid))
+        self.conn.send(self.signed(dict(msg, request_id=rid)))
         time.sleep(0.3)  # le serveur a le temps de traiter le coup
         self.conn.sock.close()
         self.log(f"[test] Requête {rid} envoyée, réponse perdue. On la renvoie avec le même request_id...")
